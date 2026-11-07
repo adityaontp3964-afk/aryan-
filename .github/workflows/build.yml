@@ -1,0 +1,111 @@
+name: Build FRIDAY debug APK
+
+# Written for this project (verified from the source tree):
+#   settings.gradle.kts + build.gradle.kts at the repository root, single application module ":app"
+#   AGP 8.5.2 (needs Gradle 8.7+ and JDK 17), Kotlin 1.9.24, compileSdk 34, no product flavors
+#   No Gradle wrapper is included, so Gradle 8.7 is provisioned by gradle/actions/setup-gradle.
+#   Debug APK: app/build/outputs/apk/debug/app-debug.apk (debug builds need no signing key)
+# If the repository contains only friday-android-project.zip, the first step unzips it.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'app/**'
+      - '*.gradle.kts'
+      - 'gradle.properties'
+      - '*.zip'
+      - '.github/workflows/build.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Locate project folder (unzips a ZIP if needed)
+        run: |
+          if [ -z "$(find . -maxdepth 3 -name settings.gradle.kts -not -path './.git/*' | head -n 1)" ]; then
+            z=$(find . -maxdepth 2 -name '*.zip' -not -path './.git/*' | head -n 1)
+            if [ -n "$z" ]; then
+              echo "No project files found, unzipping $z"
+              mkdir -p _project
+              unzip -q "$z" -d _project
+            fi
+          fi
+          f=$(find . -maxdepth 3 -name settings.gradle.kts -not -path './.git/*' | head -n 1)
+          if [ -z "$f" ]; then
+            echo "::error::settings.gradle.kts not found, even after trying to unzip."
+            ls -la
+            exit 1
+          fi
+          dir=$(dirname "$f")
+          echo "Project folder: $dir"
+          for g in build.gradle.kts app/build.gradle.kts app/src/main/AndroidManifest.xml; do
+            test -f "$dir/$g" || { echo "::error::Missing $dir/$g"; exit 1; }
+          done
+          echo "PROJECT_DIR=$dir" >> "$GITHUB_ENV"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle 8.7
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Accept Android SDK licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - name: Build debug APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -o pipefail
+          gradle --no-daemon --console=plain --warning-mode=none :app:assembleDebug 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+
+      - name: Show compile errors (read this first)
+        if: failure()
+        run: |
+          echo "=== Kotlin/Java errors ==="
+          grep -nE "^e: |error:|What went wrong|Execution failed|Unresolved|FAILED" "$GITHUB_WORKSPACE/build.log" | head -60 || true
+          { echo "### Build errors"; echo '```'; grep -E "^e: |What went wrong|Execution failed" -A2 "$GITHUB_WORKSPACE/build.log" | head -80; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload build log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: friday-debug-apk
+          path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+
+      # Runs after the APK upload so a failing unit test never hides a good APK; a failure here still turns the run red.
+      - name: Unit tests
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: gradle --no-daemon --console=plain --warning-mode=none :app:testDebugUnitTest
+
+      - name: Upload test report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: friday-test-report
+          path: ${{ env.PROJECT_DIR }}/app/build/reports/tests/
+          if-no-files-found: ignore
